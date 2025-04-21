@@ -9,6 +9,18 @@ DWipe is a powerful cross-platform tool for securely wiping free space and forma
 - **Two operation modes**:
   - Free space wiping (securely wipes only unused space)
   - Full disk formatting (erases entire drives securely)
+- **Advanced Security Features**:
+  - HPA (Host Protected Area) removal and wiping
+  - DCO (Device Configuration Overlay) removal and wiping
+  - SMART data and logs clearing
+  - Drive cache and buffer flushing
+  - Remapped/reallocated sector handling
+  - Enhanced Secure Erase (when supported by drive)
+  - Firmware-level secure operations
+  - G-List (Growth Defect List) handling
+  - P-List (Primary Defect List) handling
+  - Service Area/System Area wiping
+  - Vendor-specific reserved area handling
 - **Configurable wiping patterns**:
   - Zero-fill (all zeros)
   - One-fill (all ones)
@@ -223,6 +235,61 @@ Another novelty pattern that repeats the ASCII characters "haha-" throughout the
 
 For maximum security, use the default `all` pattern with at least 3 passes. The US Department of Defense previously recommended multiple passes with different patterns to ensure data cannot be recovered using specialized equipment.
 
+## Advanced Security Features
+
+DWipe implements comprehensive security measures to ensure the most thorough data sanitization possible:
+
+### Hidden Area Handling
+
+1. **HPA (Host Protected Area)**
+   - Automatically detects and removes HPA
+   - Exposes full drive capacity
+   - Wipes previously hidden sectors
+   - Prevents HPA restoration
+
+2. **DCO (Device Configuration Overlay)**
+   - Removes DCO restrictions
+   - Accesses manufacturer-hidden areas
+   - Ensures complete drive access
+   - Prevents DCO restoration
+
+### Drive Data Sanitization
+
+1. **SMART Data**
+   - Clears SMART logs and attributes
+   - Removes historical drive data
+   - Eliminates diagnostic information
+   - Wipes performance records
+
+2. **Cache and Buffer**
+   - Flushes drive cache
+   - Clears drive buffer
+   - Disables write cache during operation
+   - Forces cache synchronization
+
+3. **Sector Management**
+   - Handles remapped sectors
+   - Processes reallocated areas
+   - Manages Growth Defect List (G-List)
+   - Handles Primary Defect List (P-List)
+
+4. **Enhanced Security**
+   - Uses ATA Enhanced Secure Erase when available
+   - Accesses firmware-level secure operations
+   - Handles vendor-specific reserved areas
+   - Ensures complete drive sanitization
+
+### Safety Considerations
+
+All security operations are implemented using standard drive commands that:
+- Are part of ATA/SCSI specifications
+- Use manufacturer-approved operations
+- Don't exceed drive specifications
+- Skip unsupported features safely
+- Preserve drive health and longevity
+
+These features are automatically applied during disk formatting operations, requiring no additional user configuration while ensuring maximum security. 
+
 ## Security Standards and Modern Recommendations
 
 While DWipe implements the classic multi-pass wiping approach, it's worth noting that current data sanitization standards have evolved:
@@ -297,13 +364,19 @@ If you encounter issues not covered in this documentation, please file an issue 
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
+## Credit
+
+- InfoSecREDD (Myself)
+
 ## Acknowledgments
 
 - Inspired by secure data wiping standards and best practices
 - Thanks to all contributors and testers who have helped improve this tool
+- "iamJakoby" for the idea on "ASCII Dicks" novelty write method
+- BleachBit for being a inspiration
 
 ## Disclaimer
 
 While DWipe implements secure wiping techniques, no software can guarantee 100% data destruction on all storage types. Modern SSDs, for example, use wear-leveling that may preserve some data blocks despite overwriting. For maximum security on highly sensitive data, physical destruction of media may be necessary.
 
-The authors are not responsible for any data loss resulting from the use of this tool. 
+The authors are not responsible for any data loss resulting from the use of this tool.
