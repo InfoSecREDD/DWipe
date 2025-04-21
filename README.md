@@ -34,97 +34,6 @@ The default wiping method uses a sequence of different patterns across multiple 
 
 This multi-pattern approach provides high security for data sanitization.
 
-### zeroes
-Fills the free space with all zeros (0x00 bytes). This basic pattern overwrites data with null bytes, which is fast but less secure than other patterns when used alone.
-
-```
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-```
-
-### ones
-Fills the free space with all ones (0xFF bytes). This creates a pattern of all bits set to 1, which is useful as part of a multi-pass approach.
-
-```
-FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
-FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
-```
-
-### random
-Fills the free space with cryptographically secure random data using Python's `os.urandom()`. This is considered highly secure as it introduces true randomness that makes data recovery more difficult.
-
-The random pattern produces different values on each execution:
-```
-A3 F5 9C 23 7D E8 B2 5F 01 C6 ... (random bytes)
-```
-
-### dicks
-A novelty pattern that repeats the ASCII characters "3===D" throughout the free space. This is primarily for humor and not recommended for serious security applications.
-
-```
-33 3D 3D 3D 44 33 3D 3D 3D 44 33 3D 3D 3D 44 ...
-```
-
-### haha
-Another novelty pattern that repeats the ASCII characters "haha-" throughout the free space. Like the "dicks" pattern, this is included for fun rather than security.
-
-```
-68 61 68 61 2D 68 61 68 61 2D 68 61 68 61 2D ...
-```
-
-For maximum security, use the default `all` pattern with at least 3 passes. The US Department of Defense previously recommended multiple passes with different patterns to ensure data cannot be recovered using specialized equipment.
-
-## Security Standards and Modern Recommendations
-
-While DWipe implements the classic multi-pass wiping approach, it's worth noting that current data sanitization standards have evolved:
-
-1. **Historical DoD Standard**: The Department of Defense 5220.22-M standard was often cited as requiring multiple overwrite passes (3 or 7 passes). This standard became widely referenced in data security.
-
-2. **Current NIST Guidance**: The National Institute of Standards and Technology (NIST) Special Publication 800-88 ("Guidelines for Media Sanitization") has superseded the old DoD standards. For modern storage devices, NIST generally recognizes that a single overwrite pass is sufficient for conventional hard drives.
-
-3. **Modern Storage Considerations**: 
-   - For HDDs: Single-pass overwriting is generally effective due to high recording densities of modern drives
-   - For SSDs: Overwriting is less effective due to wear-leveling algorithms and block management. Secure erase commands or encryption-based sanitization are preferred
-
-DWipe's multi-pass approach provides a thorough and conservative method that exceeds current minimum recommendations, giving users higher confidence that data cannot be recovered, especially on older storage media.
-
-## Secure Erasure for SSDs and Wear-Leveling
-
-### The Wear-Leveling Challenge
-
-Standard overwriting techniques (including DWipe's multi-pass approach) have limitations when applied to Solid State Drives (SSDs) due to:
-
-1. **Wear-leveling technology**: SSDs distribute writes across memory cells to extend drive life. When you "overwrite" data, the SSD controller may write to new cells and mark old cells for later reuse, leaving original data intact.
-
-2. **Over-provisioning**: SSDs contain extra storage capacity not accessible to the operating system, which may contain remnants of sensitive data.
-
-3. **Block remapping**: Bad blocks are remapped to spare areas, potentially leaving data in inaccessible areas.
-
-### Most Effective SSD Sanitization Methods
-
-For complete SSD sanitization, in order of effectiveness:
-
-1. **ATA/NVMe Secure Erase Commands**: Uses manufacturer-implemented firmware commands to erase all flash memory cells.
-   - For SATA SSDs: `hdparm --security-erase` (Linux)
-   - For NVMe SSDs: `nvme format` or `nvme sanitize` (most secure)
-
-2. **Manufacturer Tools**: Most SSD manufacturers provide secure erasure utilities designed for their specific hardware.
-   - Samsung Magician
-   - Western Digital Dashboard
-   - Crucial Storage Executive
-   - Intel Memory & Storage Tool
-
-3. **Encryption-Based Method**:
-   - Enable full disk encryption before using the drive
-   - Fill the drive with data
-   - Securely erase the encryption keys (most operating systems provide this option)
-
-4. **Physical Destruction**: For highest security, physical destruction remains the only absolutely certain method.
-   - Shredding
-   - Disintegration 
-   - Pulverization
-   - High-temperature incineration
-
 ### DWipe and SSDs
 
 While DWipe's multi-pass wiping is still valuable for SSDs by filling all user-accessible areas, it cannot guarantee access to wear-leveled blocks. For maximum security with SSDs:
@@ -272,6 +181,99 @@ python dwipe.py format -d /dev/diskX -l "MyDrive"
 1. Initial format to create a clean filesystem
 2. Free space wiping with multiple passes
 3. Final format to complete the sanitization process
+
+
+### zeroes
+Fills the free space with all zeros (0x00 bytes). This basic pattern overwrites data with null bytes, which is fast but less secure than other patterns when used alone.
+
+```
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+### ones
+Fills the free space with all ones (0xFF bytes). This creates a pattern of all bits set to 1, which is useful as part of a multi-pass approach.
+
+```
+FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+```
+
+### random
+Fills the free space with cryptographically secure random data using Python's `os.urandom()`. This is considered highly secure as it introduces true randomness that makes data recovery more difficult.
+
+The random pattern produces different values on each execution:
+```
+A3 F5 9C 23 7D E8 B2 5F 01 C6 ... (random bytes)
+```
+
+### dicks
+A novelty pattern that repeats the ASCII characters "3===D" throughout the free space. This is primarily for humor and not recommended for serious security applications.
+
+```
+33 3D 3D 3D 44 33 3D 3D 3D 44 33 3D 3D 3D 44 ...
+```
+
+### haha
+Another novelty pattern that repeats the ASCII characters "haha-" throughout the free space. Like the "dicks" pattern, this is included for fun rather than security.
+
+```
+68 61 68 61 2D 68 61 68 61 2D 68 61 68 61 2D ...
+```
+
+For maximum security, use the default `all` pattern with at least 3 passes. The US Department of Defense previously recommended multiple passes with different patterns to ensure data cannot be recovered using specialized equipment.
+
+## Security Standards and Modern Recommendations
+
+While DWipe implements the classic multi-pass wiping approach, it's worth noting that current data sanitization standards have evolved:
+
+1. **Historical DoD Standard**: The Department of Defense 5220.22-M standard was often cited as requiring multiple overwrite passes (3 or 7 passes). This standard became widely referenced in data security.
+
+2. **Current NIST Guidance**: The National Institute of Standards and Technology (NIST) Special Publication 800-88 ("Guidelines for Media Sanitization") has superseded the old DoD standards. For modern storage devices, NIST generally recognizes that a single overwrite pass is sufficient for conventional hard drives.
+
+3. **Modern Storage Considerations**: 
+   - For HDDs: Single-pass overwriting is generally effective due to high recording densities of modern drives
+   - For SSDs: Overwriting is less effective due to wear-leveling algorithms and block management. Secure erase commands or encryption-based sanitization are preferred
+
+DWipe's multi-pass approach provides a thorough and conservative method that exceeds current minimum recommendations, giving users higher confidence that data cannot be recovered, especially on older storage media.
+
+## Secure Erasure for SSDs and Wear-Leveling
+
+### The Wear-Leveling Challenge
+
+Standard overwriting techniques (including DWipe's multi-pass approach) have limitations when applied to Solid State Drives (SSDs) due to:
+
+1. **Wear-leveling technology**: SSDs distribute writes across memory cells to extend drive life. When you "overwrite" data, the SSD controller may write to new cells and mark old cells for later reuse, leaving original data intact.
+
+2. **Over-provisioning**: SSDs contain extra storage capacity not accessible to the operating system, which may contain remnants of sensitive data.
+
+3. **Block remapping**: Bad blocks are remapped to spare areas, potentially leaving data in inaccessible areas.
+
+### Most Effective SSD Sanitization Methods
+
+For complete SSD sanitization, in order of effectiveness:
+
+1. **ATA/NVMe Secure Erase Commands**: Uses manufacturer-implemented firmware commands to erase all flash memory cells.
+   - For SATA SSDs: `hdparm --security-erase` (Linux)
+   - For NVMe SSDs: `nvme format` or `nvme sanitize` (most secure)
+
+2. **Manufacturer Tools**: Most SSD manufacturers provide secure erasure utilities designed for their specific hardware.
+   - Samsung Magician
+   - Western Digital Dashboard
+   - Crucial Storage Executive
+   - Intel Memory & Storage Tool
+
+3. **Encryption-Based Method**:
+   - Enable full disk encryption before using the drive
+   - Fill the drive with data
+   - Securely erase the encryption keys (most operating systems provide this option)
+
+4. **Physical Destruction**: For highest security, physical destruction remains the only absolutely certain method.
+   - Shredding
+   - Disintegration 
+   - Pulverization
+   - High-temperature incineration
+
 
 ## Troubleshooting
 
