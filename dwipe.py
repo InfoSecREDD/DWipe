@@ -4,17 +4,66 @@ import sys
 import subprocess
 import platform
 
+# Global variable to store disk information
+SELECTED_DISK_INFO = None
+
 # --- VENV SETUP ---
 VENV_DIR = os.path.join(os.path.dirname(__file__), 'venv')
 
 def ensure_venv():
+    """Check if running in virtual environment and set up if needed. Silent unless installation required."""
     in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
+    
     if not in_venv:
-        subprocess.check_call([sys.executable, '-m', 'venv', VENV_DIR])
-        pip = os.path.join(VENV_DIR, 'bin', 'pip')
-        subprocess.check_call([pip, 'install', '--upgrade', 'pip'])
-        subprocess.check_call([pip, 'install', 'tqdm', 'colorama', 'psutil'])
-        python_bin = os.path.join(VENV_DIR, 'bin', 'python')
+        # Check if venv exists first
+        if not os.path.exists(VENV_DIR):
+            print(f"Creating virtual environment in {VENV_DIR}...")
+            subprocess.check_call([sys.executable, '-m', 'venv', VENV_DIR], 
+                                 stdout=subprocess.DEVNULL if os.name != 'nt' else None)
+            
+        # Prepare paths - handle platform differences
+        if platform.system() == 'Windows':
+            pip = os.path.join(VENV_DIR, 'Scripts', 'pip.exe')
+            python_bin = os.path.join(VENV_DIR, 'Scripts', 'python.exe')
+        else:
+            pip = os.path.join(VENV_DIR, 'bin', 'pip')
+            python_bin = os.path.join(VENV_DIR, 'bin', 'python')
+            
+        # Check if executable files exist
+        if not os.path.isfile(pip) or not os.path.isfile(python_bin):
+            print(f"Warning: Virtual environment files not found. Recreating...")
+            import shutil
+            if os.path.exists(VENV_DIR):
+                shutil.rmtree(VENV_DIR)
+            subprocess.check_call([sys.executable, '-m', 'venv', VENV_DIR])
+        
+        # Check if requirements are installed silently
+        required_packages = ['tqdm', 'colorama', 'psutil']
+        missing_packages = []
+        
+        # Use subprocess.DEVNULL to hide output during checking
+        for package in required_packages:
+            try:
+                # Check if package is installed silently
+                result = subprocess.run(
+                    [pip, 'show', package], 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+                if result.returncode != 0:
+                    missing_packages.append(package)
+            except Exception:
+                missing_packages.append(package)
+        
+        # If any packages are missing, install them
+        if missing_packages:
+            print(f"Installing required packages: {', '.join(missing_packages)}")
+            # Upgrade pip first
+            subprocess.check_call([pip, 'install', '--upgrade', 'pip'])
+            # Install missing packages
+            subprocess.check_call([pip, 'install'] + missing_packages)
+            
+        # Execute the script within the virtual environment
         os.execv(python_bin, [python_bin] + sys.argv)
 
 ensure_venv()
@@ -56,7 +105,7 @@ def print_colorful_banner():
         "▓  ▓▓▓▓  ▓▓        ▓▓▓▓▓  ▓▓▓▓▓       ▓▓▓      ▓▓▓",
         "█  ████  ██   ██   █████  █████  ████████  ███████",
         "█       ███  ████  ██        ██  ████████        █",
-        "       D W i p e  v1.2      "
+        "       D W i p e  v1.5      "
     ]
     
     colors = [RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN]
@@ -389,6 +438,7 @@ def get_free_space(path):
 
 def interactive_drive_selection():
     """Display interactive menu to select drive."""
+    global SELECTED_DISK_INFO
     drives = get_physical_drives()
     
     if not drives:
@@ -437,6 +487,9 @@ def interactive_drive_selection():
             drive_id = int(choice)
             for drive in drives:
                 if drive['id'] == drive_id:
+                    # Store the selected disk info globally
+                    SELECTED_DISK_INFO = drive
+                    
                     # Check if this mount point needs special handling
                     mount_point = drive['mountpoint']
                     writable_path = find_writable_path_for_volume(mount_point)
@@ -746,7 +799,7 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
             label = input().strip() or None
             
             # Call format_disk with the device path
-            format_disk(device_path, filesystem, label, no_confirm)
+            format_disk(device_path, filesystem, label, no_confirm, pattern=pattern, verify=verify)
             return  # Exit this function
     
     # If free_space is still 0, try to get it one more time to be sure
@@ -985,11 +1038,211 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
         atexit.unregister(cleanup_temp_files)
         cleanup_temp_files()
 
-def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, passes=3, pattern='all'):
-    """Format an entire disk with the specified filesystem.
-    
-    WARNING: This is a destructive operation that will erase ALL data on the disk.
-    """
+def check_hpa_dco(disk_path):
+    """Check for HPA/DCO on a disk and attempt to remove them."""
+    system = platform.system()
+    has_hidden_areas = False
+    messages = []
+
+    try:
+        if system == 'Linux':
+            # Check for hdparm
+            if subprocess.run(['which', 'hdparm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Get device info and original size
+                result = subprocess.run(['hdparm', '-N', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    if "HPA" in result.stdout:
+                        has_hidden_areas = True
+                        messages.append(f"{YELLOW}HPA detected on {disk_path}{RESET}")
+                        
+                # Check for DCO
+                result = subprocess.run(['hdparm', '-I', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    if "DCO is" in result.stdout and "not" not in result.stdout:
+                        has_hidden_areas = True
+                        messages.append(f"{YELLOW}DCO detected on {disk_path}{RESET}")
+
+        elif system == 'Darwin':  # macOS
+            # Use diskutil info to check for hidden areas
+            result = subprocess.run(['diskutil', 'info', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                if "Hidden" in result.stdout:
+                    has_hidden_areas = True
+                    messages.append(f"{YELLOW}Hidden areas detected on {disk_path}{RESET}")
+
+    except Exception as e:
+        messages.append(f"{YELLOW}Warning: Could not check for HPA/DCO: {e}{RESET}")
+        return False, messages
+
+    return has_hidden_areas, messages
+
+def remove_hpa_dco(disk_path):
+    """Remove HPA/DCO from a disk. Returns success status and messages."""
+    system = platform.system()
+    success = False
+    messages = []
+
+    try:
+        if system == 'Linux':
+            if subprocess.run(['which', 'hdparm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Try to remove HPA
+                result = subprocess.run(['hdparm', '--yes-i-know-what-i-am-doing', '--native-max', disk_path],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    messages.append(f"{GREEN}Successfully removed HPA from {disk_path}{RESET}")
+                    success = True
+                else:
+                    messages.append(f"{YELLOW}Failed to remove HPA: {result.stderr}{RESET}")
+
+                # Try to remove DCO
+                result = subprocess.run(['hdparm', '--yes-i-know-what-i-am-doing', '--dco-restore', disk_path],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    messages.append(f"{GREEN}Successfully removed DCO from {disk_path}{RESET}")
+                    success = True
+                else:
+                    messages.append(f"{YELLOW}Failed to remove DCO: {result.stderr}{RESET}")
+
+        elif system == 'Darwin':
+            messages.append(f"{YELLOW}HPA/DCO removal not directly supported on macOS{RESET}")
+            messages.append(f"{YELLOW}Consider using Linux-based tools for complete disk sanitization{RESET}")
+
+    except Exception as e:
+        messages.append(f"{YELLOW}Error attempting to remove HPA/DCO: {e}{RESET}")
+        return False, messages
+
+    return success, messages
+
+def write_to_raw_disk(disk_path, pattern='random', block_size=1048576):
+    """Write directly to disk to ensure hidden areas are overwritten."""
+    try:
+        with open(disk_path, 'wb') as f:
+            # Write a full block of data
+            if pattern == 'random':
+                data = os.urandom(block_size)
+            elif pattern == 'ones':
+                data = b'\xFF' * block_size
+            else:  # zeroes
+                data = b'\x00' * block_size
+            
+            try:
+                while True:
+                    f.write(data)
+                    f.flush()
+            except OSError as e:
+                if e.errno != errno.ENOSPC:  # Ignore "no space left" errors
+                    raise
+    except Exception as e:
+        print(f"{YELLOW}Warning: Error while writing to previously hidden areas: {e}{RESET}")
+
+def clear_smart_data(disk_path):
+    """Clear SMART data and logs from the drive."""
+    system = platform.system()
+    messages = []
+    success = False
+
+    try:
+        if system == 'Linux':
+            # Check for smartctl
+            if subprocess.run(['which', 'smartctl'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Clear SMART logs
+                result = subprocess.run(['smartctl', '-C', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    messages.append(f"{GREEN}Successfully cleared SMART logs{RESET}")
+                    success = True
+                else:
+                    messages.append(f"{YELLOW}Failed to clear SMART logs: {result.stderr}{RESET}")
+        elif system == 'Darwin':
+            messages.append(f"{YELLOW}SMART data clearing not directly supported on macOS{RESET}")
+    except Exception as e:
+        messages.append(f"{YELLOW}Error clearing SMART data: {e}{RESET}")
+
+    return success, messages
+
+def clear_drive_cache(disk_path):
+    """Clear drive cache and buffer."""
+    system = platform.system()
+    messages = []
+    success = False
+
+    try:
+        if system == 'Linux':
+            if subprocess.run(['which', 'hdparm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Force cache flush
+                result = subprocess.run(['hdparm', '-F', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode == 0:
+                    messages.append(f"{GREEN}Successfully flushed drive cache{RESET}")
+                    success = True
+                else:
+                    messages.append(f"{YELLOW}Failed to flush drive cache: {result.stderr}{RESET}")
+
+                # Disable write cache if possible
+                subprocess.run(['hdparm', '-W0', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        elif system == 'Darwin':
+            # On macOS, try to force a cache flush
+            subprocess.run(['diskutil', 'unmount', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(['diskutil', 'mount', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            messages.append(f"{GREEN}Attempted to flush drive cache through unmount/mount{RESET}")
+            success = True
+    except Exception as e:
+        messages.append(f"{YELLOW}Error clearing drive cache: {e}{RESET}")
+
+    return success, messages
+
+def secure_erase_enhanced(disk_path):
+    """Attempt enhanced secure erase if supported."""
+    system = platform.system()
+    messages = []
+    success = False
+
+    try:
+        if system == 'Linux':
+            if subprocess.run(['which', 'hdparm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Check if enhanced secure erase is supported
+                result = subprocess.run(['hdparm', '-I', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "enhanced security erase" in result.stdout.lower():
+                    # Attempt enhanced secure erase
+                    result = subprocess.run(['hdparm', '--security-set-pass', 'NULL', disk_path], 
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if result.returncode == 0:
+                        result = subprocess.run(['hdparm', '--security-erase-enhanced', 'NULL', disk_path],
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        if result.returncode == 0:
+                            messages.append(f"{GREEN}Successfully performed enhanced secure erase{RESET}")
+                            success = True
+                        else:
+                            messages.append(f"{YELLOW}Failed to perform enhanced secure erase{RESET}")
+    except Exception as e:
+        messages.append(f"{YELLOW}Error during enhanced secure erase: {e}{RESET}")
+
+    return success, messages
+
+def handle_remapped_sectors(disk_path):
+    """Handle remapped/reallocated sectors and defect lists."""
+    system = platform.system()
+    messages = []
+    success = False
+
+    try:
+        if system == 'Linux':
+            if subprocess.run(['which', 'smartctl'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                # Get current reallocated sector count
+                result = subprocess.run(['smartctl', '-A', disk_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "Reallocated_Sector_Ct" in result.stdout:
+                    messages.append(f"{YELLOW}Drive has reallocated sectors - these will be included in secure wipe{RESET}")
+                
+                # Force reallocation of pending sectors
+                subprocess.run(['smartctl', '-t', 'select,0-max', disk_path], 
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                success = True
+    except Exception as e:
+        messages.append(f"{YELLOW}Error handling remapped sectors: {e}{RESET}")
+
+    return success, messages
+
+def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, passes=3, pattern='all', verify=False):
+    """Format an entire disk with the specified filesystem."""
     # Banner is now only shown at program start, not here
     
     # Determine current operating system
@@ -999,90 +1252,136 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     if not os.path.exists(disk_path):
         print(f"{RED}{BRIGHT}Error: Disk {disk_path} not found.{RESET}")
         sys.exit(1)
+
+    print(f"{YELLOW}Performing comprehensive secure disk preparation...{RESET}")
+
+    # Clear drive cache first
+    success, messages = clear_drive_cache(disk_path)
+    for msg in messages:
+        print(msg)
+
+    # Handle remapped sectors and defect lists
+    success, messages = handle_remapped_sectors(disk_path)
+    for msg in messages:
+        print(msg)
+
+    # Check for and remove HPA/DCO
+    has_hidden, hpa_messages = check_hpa_dco(disk_path)
+    for msg in hpa_messages:
+        print(msg)
+
+    if has_hidden:
+        print(f"{YELLOW}Removing hidden areas (HPA/DCO) for secure wiping...{RESET}")
+        success, removal_messages = remove_hpa_dco(disk_path)
+        for msg in removal_messages:
+            print(msg)
+        
+        if success:
+            print(f"{YELLOW}Writing data to previously hidden areas...{RESET}")
+            write_to_raw_disk(disk_path, pattern='random')  # Always use random for hidden areas
+        else:
+            print(f"{YELLOW}Warning: Could not fully remove hidden areas. Some sectors may not be wiped.{RESET}")
+
+    # Try enhanced secure erase if available
+    success, messages = secure_erase_enhanced(disk_path)
+    for msg in messages:
+        print(msg)
+
+    # Clear SMART data
+    success, messages = clear_smart_data(disk_path)
+    for msg in messages:
+        print(msg)
+
+    # Final cache flush before main wipe
+    clear_drive_cache(disk_path)
     
     # Get disk information for confirmation
     disk_info = {}
     disk_id = os.path.basename(disk_path)
     
-    try:
-        if system == 'Darwin':  # macOS
-            try:
-                # Get disk info using diskutil
-                disk_info_cmd = subprocess.check_output(['diskutil', 'info', disk_id], 
-                                                      stderr=subprocess.STDOUT).decode('utf-8')
-                
-                # Extract size info
-                size_match = re.search(r'Disk Size:\s+([0-9,]+)\s+Bytes\s+\(([^)]+)\)', disk_info_cmd)
-                if size_match:
-                    size_bytes = int(size_match.group(1).replace(',', ''))
-                    size_human = size_match.group(2).strip()
-                    disk_info = {
-                        'size': size_bytes,
-                        'size_human': size_human
-                    }
+    # Use the globally stored disk info if available
+    if SELECTED_DISK_INFO is not None:
+        disk_info = SELECTED_DISK_INFO
+    else:
+        try:
+            if system == 'Darwin':  # macOS
+                try:
+                    # Get disk info using diskutil
+                    disk_info_cmd = subprocess.check_output(['diskutil', 'info', disk_id], 
+                                                          stderr=subprocess.STDOUT).decode('utf-8')
                     
-                # Extract name info
-                name_match = re.search(r'Device / Media Name:\s+(.+)', disk_info_cmd)
-                if name_match:
-                    disk_info['name'] = name_match.group(1).strip()
-                else:
-                    disk_info['name'] = disk_id
+                    # Extract size info
+                    size_match = re.search(r'Disk Size:\s+([0-9,]+)\s+Bytes\s+\(([^)]+)\)', disk_info_cmd)
+                    if size_match:
+                        size_bytes = int(size_match.group(1).replace(',', ''))
+                        size_human = size_match.group(2).strip()
+                        disk_info = {
+                            'size': size_bytes,
+                            'size_human': size_human
+                        }
+                        
+                    # Extract name info
+                    name_match = re.search(r'Device / Media Name:\s+(.+)', disk_info_cmd)
+                    if name_match:
+                        disk_info['name'] = name_match.group(1).strip()
+                    else:
+                        disk_info['name'] = disk_id
+                        
+                except subprocess.CalledProcessError as e:
+                    print(f"{YELLOW}Warning: Unable to get detailed disk information: {e}{RESET}")
                     
-            except subprocess.CalledProcessError as e:
-                print(f"{YELLOW}Warning: Unable to get detailed disk information: {e}{RESET}")
-                
-        elif system == 'Linux':
-            try:
-                # Try to get disk info using lsblk
-                disk_info_cmd = subprocess.check_output(['lsblk', '-bdno', 'SIZE,MODEL', disk_path], 
-                                                      stderr=subprocess.STDOUT).decode('utf-8').strip()
-                if disk_info_cmd:
-                    parts = disk_info_cmd.split()
-                    if parts:
-                        size_bytes = int(parts[0])
+            elif system == 'Linux':
+                try:
+                    # Try to get disk info using lsblk
+                    disk_info_cmd = subprocess.check_output(['lsblk', '-bdno', 'SIZE,MODEL', disk_path], 
+                                                          stderr=subprocess.STDOUT).decode('utf-8').strip()
+                    if disk_info_cmd:
+                        parts = disk_info_cmd.split()
+                        if parts:
+                            size_bytes = int(parts[0])
+                            disk_info['size'] = size_bytes
+                            disk_info['size_human'] = format_size(size_bytes)
+                            if len(parts) > 1:
+                                disk_info['name'] = ' '.join(parts[1:])
+                            else:
+                                disk_info['name'] = disk_id
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    try:
+                        # Fallback to fdisk
+                        disk_info_cmd = subprocess.check_output(['fdisk', '-l', disk_path], 
+                                                              stderr=subprocess.STDOUT).decode('utf-8')
+                        size_match = re.search(r'Disk\s+.*?:\s+([0-9.]+\s+[A-Za-z]+)', disk_info_cmd)
+                        if size_match:
+                            disk_info['size_human'] = size_match.group(1)
+                            disk_info['name'] = disk_id
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        print(f"{YELLOW}Warning: Unable to get detailed disk information{RESET}")
+                        
+            elif system == 'Windows':
+                try:
+                    # Get disk info using PowerShell
+                    ps_cmd = f'Get-Disk | Where-Object {{ $_.DeviceId -eq "{disk_id}" }} | Format-List'
+                    disk_info_cmd = subprocess.check_output(['powershell', '-Command', ps_cmd], 
+                                                          stderr=subprocess.STDOUT).decode('utf-8')
+                    
+                    # Extract size and model info from the output
+                    size_match = re.search(r'Size\s*:\s*([0-9,]+)', disk_info_cmd)
+                    model_match = re.search(r'FriendlyName\s*:\s*(.+)', disk_info_cmd)
+                    
+                    if size_match:
+                        size_bytes = int(size_match.group(1).replace(',', ''))
                         disk_info['size'] = size_bytes
                         disk_info['size_human'] = format_size(size_bytes)
-                        if len(parts) > 1:
-                            disk_info['name'] = ' '.join(parts[1:])
-                        else:
-                            disk_info['name'] = disk_id
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                try:
-                    # Fallback to fdisk
-                    disk_info_cmd = subprocess.check_output(['fdisk', '-l', disk_path], 
-                                                          stderr=subprocess.STDOUT).decode('utf-8')
-                    size_match = re.search(r'Disk\s+.*?:\s+([0-9.]+\s+[A-Za-z]+)', disk_info_cmd)
-                    if size_match:
-                        disk_info['size_human'] = size_match.group(1)
-                        disk_info['name'] = disk_id
+                    
+                    if model_match:
+                        disk_info['name'] = model_match.group(1).strip()
+                    else:
+                        disk_info['name'] = f"Disk {disk_id}"
+                        
                 except (subprocess.CalledProcessError, FileNotFoundError):
                     print(f"{YELLOW}Warning: Unable to get detailed disk information{RESET}")
-                    
-        elif system == 'Windows':
-            try:
-                # Get disk info using PowerShell
-                ps_cmd = f'Get-Disk | Where-Object {{ $_.DeviceId -eq "{disk_id}" }} | Format-List'
-                disk_info_cmd = subprocess.check_output(['powershell', '-Command', ps_cmd], 
-                                                      stderr=subprocess.STDOUT).decode('utf-8')
-                
-                # Extract size and model info from the output
-                size_match = re.search(r'Size\s*:\s*([0-9,]+)', disk_info_cmd)
-                model_match = re.search(r'FriendlyName\s*:\s*(.+)', disk_info_cmd)
-                
-                if size_match:
-                    size_bytes = int(size_match.group(1).replace(',', ''))
-                    disk_info['size'] = size_bytes
-                    disk_info['size_human'] = format_size(size_bytes)
-                
-                if model_match:
-                    disk_info['name'] = model_match.group(1).strip()
-                else:
-                    disk_info['name'] = f"Disk {disk_id}"
-                    
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                print(f"{YELLOW}Warning: Unable to get detailed disk information{RESET}")
-    except Exception as e:
-        print(f"{YELLOW}Warning: Error getting disk info: {e}{RESET}")
+        except Exception as e:
+            print(f"{YELLOW}Warning: Error getting disk info: {e}{RESET}")
     
     # If we couldn't get disk info, show a generic warning
     if not disk_info:
@@ -1102,10 +1401,16 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     # -2 accounts for the space after ║ and the ║ at the end
     print(f"{RED}{BRIGHT}║{RESET} Target: {RED}{disk_path}{RESET}{' ' * (box_width - 8 - len(disk_path))}{RED}{BRIGHT}║{RESET}")
     print(f"{RED}{BRIGHT}║{RESET} Disk Name: {RED}{disk_info.get('name', 'Unknown')}{RESET}{' ' * (box_width - 11 - len(disk_info.get('name', 'Unknown')))}{RED}{BRIGHT}║{RESET}")
-    print(f"{RED}{BRIGHT}║{RESET} Size: {RED}{disk_info.get('size_human', 'Unknown')}{RESET}{' ' * (box_width - 6 - len(disk_info.get('size_human', 'Unknown')))}{RED}{BRIGHT}║{RESET}")
+    
+    # Get size from disk_info, ensuring we use the stored human-readable size
+    size_display = disk_info.get('size_human', format_size(disk_info.get('size', 0)))
+    if size_display == "0B":  # Fallback if we somehow got a zero size
+        size_display = "Unknown"
+    print(f"{RED}{BRIGHT}║{RESET} Size: {RED}{size_display}{RESET}{' ' * (box_width - 6 - len(size_display))}{RED}{BRIGHT}║{RESET}")
+    
     print(f"{RED}{BRIGHT}║{RESET} Filesystem: {RED}{filesystem.upper()}{RESET}{' ' * (box_width - 12 - len(filesystem.upper()))}{RED}{BRIGHT}║{RESET}")
     if label:
-        print(f"{RED}{BRIGHT}║{RESET} Label: {RED}{label}{RESET}{' ' * (box_width - 9 - len(label))}{RED}{BRIGHT}║{RESET}")
+        print(f"{RED}{BRIGHT}║{RESET} Label: {RED}{label}{RESET}{' ' * (box_width - 7 - len(label))}{RED}{BRIGHT}║{RESET}")
     print(f"{RED}{BRIGHT}╠═{'═' * box_width}╣{RESET}")
     
     # Break these warning messages into multiple lines if needed
@@ -1386,13 +1691,13 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     try:
         # Step 1: Initial format to prepare the disk
         print(f"{CYAN}{BRIGHT}╔═══════════════════════════════════════════════════════════╗{RESET}")
-        print(f"{CYAN}{BRIGHT}║ STEP 1: INITIAL DISK FORMAT                              ║{RESET}")
+        print(f"{CYAN}{BRIGHT}║ STEP 1: INITIAL DISK FORMAT                               ║{RESET}")
         print(f"{CYAN}{BRIGHT}╚═══════════════════════════════════════════════════════════╝{RESET}")
         perform_format("Formatting")
         
         # Step 2: Wipe free space on the newly formatted disk
         print(f"\n{CYAN}{BRIGHT}╔═══════════════════════════════════════════════════════════╗{RESET}")
-        print(f"{CYAN}{BRIGHT}║ STEP 2: SECURE FREE SPACE WIPE                           ║{RESET}")
+        print(f"{CYAN}{BRIGHT}║ STEP 2: SECURE FREE SPACE WIPE                            ║{RESET}")
         print(f"{CYAN}{BRIGHT}╚═══════════════════════════════════════════════════════════╝{RESET}")
         
         # Get the mount point of the newly formatted disk
@@ -1649,7 +1954,7 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
         
         # Step 3: Final format to complete the secure erase
         print(f"\n{CYAN}{BRIGHT}╔═══════════════════════════════════════════════════════════╗{RESET}")
-        print(f"{CYAN}{BRIGHT}║ STEP 3: FINAL DISK FORMAT                                ║{RESET}")
+        print(f"{CYAN}{BRIGHT}║ STEP 3: FINAL DISK FORMAT                                 ║{RESET}")
         print(f"{CYAN}{BRIGHT}╚═══════════════════════════════════════════════════════════╝{RESET}")
         perform_format("Final formatting")
         
@@ -1707,7 +2012,8 @@ if __name__ == '__main__':
             # Format disk mode
             format_disk(disk_path=args.disk, filesystem=args.filesystem, 
                        label=args.label, no_confirm=args.yes,
-                       passes=args.passes, pattern=args.pattern)
+                       passes=args.passes, pattern=args.pattern,
+                       verify=args.verify)
         else:
             # Default to free space wiping mode
             # Handle backward compatibility with direct arguments
