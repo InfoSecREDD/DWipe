@@ -985,7 +985,7 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
         atexit.unregister(cleanup_temp_files)
         cleanup_temp_files()
 
-def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False):
+def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, passes=3, pattern='all'):
     """Format an entire disk with the specified filesystem.
     
     WARNING: This is a destructive operation that will erase ALL data on the disk.
@@ -1445,9 +1445,9 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False):
                 signal.signal(signal.SIGINT, signal_handler)
                 
                 # Display wiping information
-                passes = 3
+                passes = passes
                 block_size = 1048576  # 1MB block size
-                pattern = 'all'
+                pattern = pattern
                 
                 box_width = 65
                 print(f"{CYAN}{BRIGHT}╔═{'═' * box_width}╗{RESET}")
@@ -1678,15 +1678,17 @@ if __name__ == '__main__':
     # Create subparsers for different modes
     subparsers = parser.add_subparsers(dest='mode', help='Operation mode')
     
+    # Add the global flags
+    parser.add_argument('-v', '--verify', action='store_true', help='Verify wiped space after each pass')
+    parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
+    parser.add_argument('-p', '--passes', type=int, default=3, help='Number of overwrite passes')
+    parser.add_argument('-t', '--pattern', choices=['all', 'zeroes', 'ones', 'random', 'dicks', 'haha'], 
+                   default='all', help='Data pattern to use (default: all with random first pass)')
+    
     # Free space wiping mode (default)
     freespace_parser = subparsers.add_parser('freespace', help='Wipe free space on a volume (default)')
     freespace_parser.add_argument('-r', '--root', default='/', help='Root path to wipe (default: interactive)')
-    freespace_parser.add_argument('-p', '--passes', type=int, default=3, help='Number of overwrite passes')
     freespace_parser.add_argument('-b', '--block', type=int, default=1048576, help='Block size in bytes')
-    freespace_parser.add_argument('-v', '--verify', action='store_true', help='Verify wiped space after each pass')
-    freespace_parser.add_argument('-t', '--pattern', choices=['all', 'zeroes', 'ones', 'random', 'dicks', 'haha'], 
-                       default='all', help='Data pattern to use (default: all with random first pass)')
-    freespace_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
     freespace_parser.add_argument('-i', '--interactive', action='store_true', help='Force interactive drive selection')
     
     # Format disk mode
@@ -1696,7 +1698,6 @@ if __name__ == '__main__':
                              choices=['exfat', 'fat32', 'ntfs', 'apfs', 'hfs+', 'ext4', 'ext3', 'ext2', 'vfat'], 
                              help='Filesystem to use (default: exfat, availability depends on OS)')
     format_parser.add_argument('-l', '--label', help='Volume label for the formatted disk')
-    format_parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt (DANGEROUS)')
     
     args = parser.parse_args()
     
@@ -1705,16 +1706,17 @@ if __name__ == '__main__':
         if args.mode == 'format':
             # Format disk mode
             format_disk(disk_path=args.disk, filesystem=args.filesystem, 
-                       label=args.label, no_confirm=args.yes)
+                       label=args.label, no_confirm=args.yes,
+                       passes=args.passes, pattern=args.pattern)
         else:
             # Default to free space wiping mode
             # Handle backward compatibility with direct arguments
             root = getattr(args, 'root', '/')
-            passes = getattr(args, 'passes', 3)
+            passes = args.passes
             block = getattr(args, 'block', 1048576)
-            verify = getattr(args, 'verify', False)
-            pattern = getattr(args, 'pattern', 'all')
-            no_confirm = getattr(args, 'yes', False)
+            verify = args.verify
+            pattern = args.pattern
+            no_confirm = args.yes
             interactive = getattr(args, 'interactive', False)
             
             # Force interactive mode if requested
