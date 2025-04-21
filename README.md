@@ -33,18 +33,6 @@ DWipe is a powerful cross-platform tool for securely wiping free space and forma
 - **User-friendly interface**: Colorful, intuitive console interface with clear status information
 - **Automatic filesystem detection**: Identifies and works with all major filesystem types
 
-## Wiping Patterns
-
-DWipe offers multiple data patterns for secure wiping through the `-t` parameter:
-
-### all (Default)
-The default wiping method uses a sequence of different patterns across multiple passes:
-- First pass: **Random data** (cryptographically secure random bytes)
-- Second pass: **All zeros** (0x00 bytes)
-- Third pass: **All ones** (0xFF bytes)
-- Subsequent passes: Cycles through random, zeros, and ones
-
-This multi-pattern approach provides high security for data sanitization.
 
 ### DWipe and SSDs
 
@@ -194,6 +182,18 @@ python dwipe.py format -d /dev/diskX -l "MyDrive"
 2. Free space wiping with multiple passes
 3. Final format to complete the sanitization process
 
+## Wiping Patterns
+
+DWipe offers multiple data patterns for secure wiping through the `-t` parameter:
+
+### all (Default)
+The default wiping method uses a sequence of different patterns across multiple passes:
+- First pass: **Random data** (cryptographically secure random bytes)
+- Second pass: **All zeros** (0x00 bytes)
+- Third pass: **All ones** (0xFF bytes)
+- Subsequent passes: Cycles through random, zeros, and ones
+
+This multi-pattern approach provides high security for data sanitization.
 
 ### zeroes
 Fills the free space with all zeros (0x00 bytes). This basic pattern overwrites data with null bytes, which is fast but less secure than other patterns when used alone.
