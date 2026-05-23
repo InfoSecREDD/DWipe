@@ -996,7 +996,15 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
             label = input().strip() or None
             
             # Call format_disk with the device path
-            format_disk(device_path, filesystem, label, no_confirm, pattern=pattern, verify=verify)
+            format_disk(
+                device_path,
+                filesystem,
+                label,
+                no_confirm,
+                passes=passes,
+                pattern=pattern,
+                verify=verify,
+            )
             return  # Exit this function
     
     # If free_space is still 0, try to get it one more time to be sure

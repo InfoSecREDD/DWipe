@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import os
 import sys
@@ -55,6 +56,78 @@ class CrossPlatformTests(unittest.TestCase):
         cls.Completed = namedtuple("Completed", "returncode stdout stderr")
         cls.Partition = namedtuple("Partition", "device mountpoint fstype opts")
         cls.Usage = namedtuple("Usage", "total free")
+
+    def _capture_single_wipe_chunk(self, pattern, block_size=10):
+        writes = []
+
+        class FakeProgressBar:
+            disable = False
+
+            def update(self, amount):
+                return None
+
+            def close(self):
+                return None
+
+        class FakeFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def write(self, chunk):
+                writes.append(chunk)
+                raise OSError(errno.ENOSPC, "disk full")
+
+            def flush(self):
+                return None
+
+            def fileno(self):
+                return 1
+
+        time_values = iter([0, 1, 2])
+
+        with mock.patch.object(self.dwipe, "find_writable_path", return_value=("/mnt", block_size)), mock.patch.object(
+            self.dwipe, "get_device_path_for_mount", return_value=None
+        ), mock.patch.object(
+            self.dwipe, "tqdm", return_value=FakeProgressBar()
+        ), mock.patch.object(
+            self.dwipe.time, "time", side_effect=lambda: next(time_values)
+        ), mock.patch.object(
+            self.dwipe.os, "urandom", return_value=b"R" * block_size
+        ), mock.patch.object(
+            self.dwipe.atexit, "register"
+        ), mock.patch.object(
+            self.dwipe.atexit, "unregister"
+        ), mock.patch.object(
+            self.dwipe.signal, "signal"
+        ), mock.patch.object(
+            self.dwipe.os.path, "exists", return_value=False
+        ), mock.patch.object(
+            self.dwipe.os, "remove"
+        ), mock.patch.object(
+            self.dwipe.os, "fsync"
+        ), mock.patch.object(
+            self.dwipe.sys.stdout, "write"
+        ), mock.patch.object(
+            self.dwipe.sys.stdout, "flush"
+        ), mock.patch(
+            "builtins.open", return_value=FakeFile()
+        ), mock.patch(
+            "builtins.print"
+        ):
+            self.dwipe.wipe_free_space(
+                root="/mnt",
+                passes=1,
+                block_size=block_size,
+                verify=False,
+                pattern=pattern,
+                no_confirm=True,
+            )
+
+        self.assertTrue(writes)
+        return writes[0]
 
     def test_parse_windows_disk_number_accepts_multiple_forms(self):
         self.assertEqual(self.dwipe.parse_windows_disk_number(r"\\.\PhysicalDrive7"), "7")
@@ -139,6 +212,131 @@ class CrossPlatformTests(unittest.TestCase):
         self.assertEqual(len(drives), 1)
         self.assertEqual(drives[0]["device"], "/dev/nvme0n1")
         self.assertEqual(drives[0]["mountpoint"], "/mnt/data")
+
+    def test_wipe_free_space_patterns_generate_expected_chunks(self):
+        expected_chunks = {
+            "zeroes": bytes([0]) * 10,
+            "ones": bytes([0xFF]) * 10,
+            "dicks": b"3===D3===D",
+            "haha": b"haha-haha-",
+            "random": b"R" * 10,
+            "all": b"R" * 10,
+        }
+
+        for pattern, expected in expected_chunks.items():
+            with self.subTest(pattern=pattern):
+                self.assertEqual(self._capture_single_wipe_chunk(pattern), expected)
+
+    def test_wipe_free_space_switches_to_format_with_selected_options(self):
+        with mock.patch.object(self.dwipe, "find_writable_path", return_value=("/mnt", 1024)), mock.patch.object(
+            self.dwipe, "get_device_path_for_mount", return_value="/dev/sdz"
+        ), mock.patch.object(
+            self.dwipe, "get_confirmation", return_value=True
+        ), mock.patch.object(
+            self.dwipe, "format_disk"
+        ) as format_disk, mock.patch(
+            "builtins.input", side_effect=["2", "ARCHIVE"]
+        ), mock.patch(
+            "builtins.print"
+        ):
+            self.dwipe.wipe_free_space(
+                root="/mnt",
+                passes=7,
+                block_size=4096,
+                verify=True,
+                pattern="ones",
+                no_confirm=False,
+            )
+
+        format_disk.assert_called_once_with(
+            "/dev/sdz",
+            "fat32",
+            "ARCHIVE",
+            False,
+            passes=7,
+            pattern="ones",
+            verify=True,
+        )
+
+    def test_format_disk_windows_writes_numeric_diskpart_script(self):
+        scripts = []
+
+        def fake_run(command, *args, **kwargs):
+            if command[:2] == ["diskpart", "/s"]:
+                scripts.append(Path(command[2]).read_text())
+                return self.Completed(0, "ok", "")
+            return self.Completed(0, "", "")
+
+        with mock.patch.object(self.dwipe.platform, "system", return_value="Windows"), mock.patch.object(
+            self.dwipe, "clear_drive_cache", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "handle_remapped_sectors", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "check_hpa_dco", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "secure_erase_enhanced", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "clear_smart_data", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "disk_path_exists", return_value=True
+        ), mock.patch.object(
+            self.dwipe, "run_windows_powershell", side_effect=[
+                self.Completed(0, '{"FriendlyName":"USB","Size":64000}', ""),
+                self.Completed(0, "", ""),
+            ]
+        ), mock.patch.object(
+            self.dwipe.subprocess, "run", side_effect=fake_run
+        ), mock.patch(
+            "builtins.print"
+        ):
+            self.dwipe.format_disk(
+                r"\\.\PhysicalDrive4",
+                filesystem="ntfs",
+                label="USB",
+                no_confirm=True,
+                passes=1,
+                pattern="zeroes",
+                verify=False,
+            )
+
+        self.assertGreaterEqual(len(scripts), 2)
+        self.assertTrue(all("select disk 4" in script for script in scripts))
+        self.assertTrue(all("PhysicalDrive4" not in script for script in scripts))
+
+    def test_format_disk_windows_rejects_unsupported_filesystem(self):
+        with mock.patch.object(self.dwipe.platform, "system", return_value="Windows"), mock.patch.object(
+            self.dwipe, "clear_drive_cache", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "handle_remapped_sectors", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "check_hpa_dco", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "secure_erase_enhanced", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "clear_smart_data", return_value=(False, [])
+        ), mock.patch.object(
+            self.dwipe, "disk_path_exists", return_value=True
+        ), mock.patch.object(
+            self.dwipe,
+            "run_windows_powershell",
+            return_value=self.Completed(0, '{"FriendlyName":"USB","Size":64000}', ""),
+        ), mock.patch(
+            "builtins.print"
+        ) as print_mock:
+            with self.assertRaises(SystemExit) as exc:
+                self.dwipe.format_disk(
+                    r"\\.\PhysicalDrive4",
+                    filesystem="ext4",
+                    label=None,
+                    no_confirm=True,
+                    passes=1,
+                    pattern="all",
+                    verify=False,
+                )
+
+        self.assertEqual(exc.exception.code, 1)
+        printed = " ".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("Unsupported filesystem ext4 for Windows", printed)
 
 
 if __name__ == "__main__":
