@@ -142,6 +142,84 @@ def parse_size(size_str):
             return int(size_str)
         except:
             return 0
+
+VERIFICATION_SAMPLE_SIZE = 4096
+
+def build_wipe_chunk(mode, block_size):
+    """Build a wipe chunk for the requested overwrite pattern."""
+    if mode == 'random':
+        return os.urandom(block_size)
+    if mode == 'ones':
+        return b'\xFF' * block_size
+    if mode == 'dicks':
+        pattern_bytes = b'3===D'
+        return (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
+    if mode == 'haha':
+        pattern_bytes = b'haha-'
+        return (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
+    return b'\x00' * block_size
+
+def create_secure_temp_file(directory, prefix='.dwipe_free_space_', suffix='.tmp'):
+    """Create a temporary file with restrictive permissions."""
+    fd, path = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=suffix)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return fd, path
+
+def flush_file_buffers(file_obj):
+    """Flush buffered data and request a filesystem sync."""
+    try:
+        file_obj.flush()
+    except Exception:
+        pass
+    try:
+        os.fsync(file_obj.fileno())
+    except Exception:
+        pass
+    if hasattr(os, 'sync'):
+        try:
+            os.sync()
+        except Exception:
+            pass
+
+def update_verification_samples(samples, offset, chunk):
+    """Keep a few read-back samples without storing full passes in memory."""
+    sample_size = min(len(chunk), VERIFICATION_SAMPLE_SIZE)
+    if sample_size <= 0:
+        return
+
+    sample = (offset, chunk[:sample_size])
+    if len(samples) < 2:
+        samples.append(sample)
+    elif len(samples) == 2:
+        samples.append(sample)
+    else:
+        samples[-1] = sample
+
+def verify_written_samples(file_path, samples):
+    """Verify sampled regions still match the bytes written to disk."""
+    unique_samples = []
+    seen_offsets = set()
+    for offset, expected in samples:
+        if offset in seen_offsets:
+            continue
+        unique_samples.append((offset, expected))
+        seen_offsets.add(offset)
+
+    if not unique_samples:
+        return False, "No verification samples were recorded."
+
+    with open(file_path, 'rb') as handle:
+        for offset, expected in unique_samples:
+            handle.seek(offset)
+            actual = handle.read(len(expected))
+            if actual != expected:
+                return False, f"Verification mismatch at offset {offset}."
+
+    return True, f"Verified {len(unique_samples)} sample region(s)."
+
             
     value = match.group(1).replace(',', '')
     value = float(value)
@@ -663,6 +741,83 @@ def get_free_space(path):
         except:
             return 0
 
+VERIFICATION_SAMPLE_SIZE = 4096
+
+def build_wipe_chunk(mode, block_size):
+    """Build a wipe chunk for the requested overwrite pattern."""
+    if mode == 'random':
+        return os.urandom(block_size)
+    if mode == 'ones':
+        return b'\xFF' * block_size
+    if mode == 'dicks':
+        pattern_bytes = b'3===D'
+        return (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
+    if mode == 'haha':
+        pattern_bytes = b'haha-'
+        return (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
+    return b'\x00' * block_size
+
+def create_secure_temp_file(directory, prefix='.dwipe_free_space_', suffix='.tmp'):
+    """Create a temporary file with restrictive permissions."""
+    fd, path = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=suffix)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return fd, path
+
+def flush_file_buffers(file_obj):
+    """Flush buffered data and request a filesystem sync."""
+    try:
+        file_obj.flush()
+    except Exception:
+        pass
+    try:
+        os.fsync(file_obj.fileno())
+    except Exception:
+        pass
+    if hasattr(os, 'sync'):
+        try:
+            os.sync()
+        except Exception:
+            pass
+
+def update_verification_samples(samples, offset, chunk):
+    """Keep a few read-back samples without storing full passes in memory."""
+    sample_size = min(len(chunk), VERIFICATION_SAMPLE_SIZE)
+    if sample_size <= 0:
+        return
+
+    sample = (offset, chunk[:sample_size])
+    if len(samples) < 2:
+        samples.append(sample)
+    elif len(samples) == 2:
+        samples.append(sample)
+    else:
+        samples[-1] = sample
+
+def verify_written_samples(file_path, samples):
+    """Verify sampled regions still match the bytes written to disk."""
+    unique_samples = []
+    seen_offsets = set()
+    for offset, expected in samples:
+        if offset in seen_offsets:
+            continue
+        unique_samples.append((offset, expected))
+        seen_offsets.add(offset)
+
+    if not unique_samples:
+        return False, "No verification samples were recorded."
+
+    with open(file_path, 'rb') as handle:
+        for offset, expected in unique_samples:
+            handle.seek(offset)
+            actual = handle.read(len(expected))
+            if actual != expected:
+                return False, f"Verification mismatch at offset {offset}."
+
+    return True, f"Verified {len(unique_samples)} sample region(s)."
+
 def interactive_drive_selection():
     """Display interactive menu to select drive."""
     global SELECTED_DISK_INFO
@@ -1014,10 +1169,8 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
     # Format for display only once
     free_space_display = format_size(free_space)
         
-    fname = os.path.join(root, '.dwipe_free_space.tmp')
-    
     # Set up signal handlers and cleanup functions for the temp file
-    temp_files = [fname]
+    temp_files = []
     
     # Create a container for the progress bar reference so it can be modified in closures
     progress_bar_container = {'instance': None}
@@ -1125,27 +1278,24 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
             
             # Make the progress bar accessible to the signal handler
             progress_bar_container['instance'] = progress_bar
+            verification_samples = []
+            verification_message = None
+            verification_failed = False
+            fd = None
+            fname = None
             
             try:
-                with open(fname, 'wb') as f:
+                fd, fname = create_secure_temp_file(root)
+                temp_files.append(fname)
+                with os.fdopen(fd, 'wb') as f:
+                    fd = None
                     while True:
-                        if mode == 'random':
-                            chunk = os.urandom(block_size)
-                        elif mode == 'ones':
-                            chunk = b'\xFF' * block_size
-                        elif mode == 'dicks':
-                            # Create a pattern of "3===D" repeated
-                            pattern_bytes = b'3===D'
-                            chunk = (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
-                        elif mode == 'haha':
-                            # Create a pattern of "haha-" repeated
-                            pattern_bytes = b'haha-'
-                            chunk = (pattern_bytes * (block_size // len(pattern_bytes) + 1))[:block_size]
-                        else:  # zeroes
-                            chunk = b'\x00' * block_size
+                        chunk = build_wipe_chunk(mode, block_size)
+                        chunk_offset = written
+                        update_verification_samples(verification_samples, chunk_offset, chunk)
                         
                         f.write(chunk)
-                        written += block_size
+                        written += len(chunk)
                                 
                         # Update display periodically
                         current_time = time.time()
@@ -1171,7 +1321,7 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
                             # Only update if the line has changed
                             if new_time_line != time_line:
                                 # Move cursor up one line and clear it
-                                sys.stdout.write("\033[F\033[K")
+                                sys.stdout.write("[F[K")
                                 sys.stdout.write(new_time_line + "\n")
                                 sys.stdout.flush()
                                 time_line = new_time_line
@@ -1179,11 +1329,11 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
                             last_display_time = current_time
                         
                         # Update the progress
-                        progress_bar.update(block_size)
+                        progress_bar.update(len(chunk))
                         
                         # Occasional flush
                         if written % (block_size * 100) == 0:
-                            f.flush()
+                            flush_file_buffers(f)
                             
             except OSError as e:
                 if e.errno not in (errno.ENOSPC, errno.EFBIG):
@@ -1197,12 +1347,22 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
                 # Force sync and flush before removing
                 try:
                     if 'f' in locals() and hasattr(f, 'fileno'):
-                        os.fsync(f.fileno())
+                        flush_file_buffers(f)
                 except Exception:
                     pass
+
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+                if verify and fname and os.path.exists(fname):
+                    verified, verification_message = verify_written_samples(fname, verification_samples)
+                    verification_failed = not verified
                     
                 try:
-                    if os.path.exists(fname):
+                    if fname and os.path.exists(fname):
                         os.remove(fname)
                         if fname in temp_files:  # Add check to prevent ValueError
                             temp_files.remove(fname)  # Remove from the cleanup list since we handled it
@@ -1212,11 +1372,11 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
             wiped = format_size(min(written, free_space))
             print(f"{GREEN}✓ Pass {p+1} complete, wiped ~{wiped}{RESET}")
             
-            # Verification pass if enabled
             if verify:
-                print(f"{BLUE}Verifying wiped space...{RESET}")
-                # In a real implementation, this would read back written data
-                # and verify it matches the expected pattern
+                print(f"{BLUE}Verification: {verification_message or 'No samples verified.'}{RESET}")
+                if verification_failed:
+                    print(f"{RED}Verification failed. Wipe pass could not be confirmed.{RESET}")
+                    sys.exit(1)
                 print(f"{GREEN}✓ Verification complete{RESET}")
                 
             print("")  # Empty line between passes
@@ -1963,9 +2123,8 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                 free_space_display = format_size(free_space)
                 print(f"{GREEN}Free space to wipe: {free_space_display}{RESET}")
                 
-                # Create temporary file path
-                fname = os.path.join(mount_point, '.dwipe_free_space.tmp')
-                temp_files = [fname]
+                # Track temporary files created during each wipe pass
+                temp_files = []
                 
                 # Set up cleanup function
                 def cleanup_temp_files():
@@ -2062,34 +2221,25 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                     
                     # Store reference for signal handler
                     progress_bar_container['instance'] = progress_bar
+                    verification_samples = []
+                    verification_message = None
+                    verification_failed = False
+                    fd = None
+                    fname = None
                     
-                    # Create a unique temporary file for each pass
-                    fname = os.path.join(mount_point, f'.dwipe_free_space_{p+1}.tmp')
-                    if fname not in temp_files:
+                    try:
+                        fd, fname = create_secure_temp_file(mount_point)
                         temp_files.append(fname)
-                        
-                    # Make sure any previous temp files are deleted
-                    try:
-                        if os.path.exists(fname):
-                            os.remove(fname)
-                    except:
-                        pass
-                    
-                    try:
-                        with open(fname, 'wb') as f:
+                        with os.fdopen(fd, 'wb') as f:
+                            fd = None
                             while True:
-                                if mode == 'random':
-                                    chunk = os.urandom(block_size)
-                                elif mode == 'ones':
-                                    chunk = b'\xFF' * block_size
-                                elif mode == 'zeroes':
-                                    chunk = b'\x00' * block_size
-                                else:  # Should never happen
-                                    chunk = os.urandom(block_size)
+                                chunk = build_wipe_chunk(mode, block_size)
+                                chunk_offset = written
+                                update_verification_samples(verification_samples, chunk_offset, chunk)
                                 
                                 try:
                                     f.write(chunk)
-                                    written += block_size
+                                    written += len(chunk)
                                     
                                     # Update display periodically
                                     current_time = time.time()
@@ -2114,7 +2264,7 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                                         # Only update if the line has changed
                                         if new_time_line != time_line:
                                             # Move cursor up one line and clear it
-                                            sys.stdout.write("\033[F\033[K")
+                                            sys.stdout.write("[F[K")
                                             sys.stdout.write(new_time_line + "\n")
                                             sys.stdout.flush()
                                             time_line = new_time_line
@@ -2122,11 +2272,11 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                                         last_display_time = current_time
                                     
                                     # Update the progress
-                                    progress_bar.update(block_size)
+                                    progress_bar.update(len(chunk))
                                     
                                     # Occasional flush
                                     if written % (block_size * 100) == 0:
-                                        f.flush()
+                                        flush_file_buffers(f)
                                         
                                 except OSError as e:
                                     if e.errno == errno.ENOSPC:
@@ -2146,13 +2296,23 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                         # Force sync and flush before removing
                         try:
                             if 'f' in locals() and hasattr(f, 'fileno'):
-                                os.fsync(f.fileno())
+                                flush_file_buffers(f)
                         except Exception:
                             pass
+
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+
+                        if verify and fname and os.path.exists(fname):
+                            verified, verification_message = verify_written_samples(fname, verification_samples)
+                            verification_failed = not verified
                     
                     # Always delete the temporary file after each pass
                     try:
-                        if os.path.exists(fname):
+                        if fname and os.path.exists(fname):
                             os.remove(fname)
                             if fname in temp_files:  # Add check to prevent ValueError
                                 temp_files.remove(fname)  # Remove from the cleanup list since we handled it
@@ -2170,6 +2330,11 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                     
                     wiped = format_size(min(written, free_space))
                     print(f"{GREEN}✓ Pass {p+1} complete, wiped ~{wiped}{RESET}")
+                    if verify:
+                        print(f"{BLUE}Verification: {verification_message or 'No samples verified.'}{RESET}")
+                        if verification_failed:
+                            raise RuntimeError("Verification failed during secure free-space wipe.")
+                        print(f"{GREEN}✓ Verification complete{RESET}")
                     print("")  # Empty line between passes
                 
                 # Calculate total time taken

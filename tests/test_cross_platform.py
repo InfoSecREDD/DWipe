@@ -2,6 +2,7 @@ import errno
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from collections import namedtuple
@@ -107,13 +108,19 @@ class CrossPlatformTests(unittest.TestCase):
         ), mock.patch.object(
             self.dwipe.os, "remove"
         ), mock.patch.object(
+            self.dwipe.os, "sync"
+        ), mock.patch.object(
             self.dwipe.os, "fsync"
+        ), mock.patch.object(
+            self.dwipe.os, "fdopen", return_value=FakeFile()
+        ), mock.patch.object(
+            self.dwipe.os, "chmod"
+        ), mock.patch.object(
+            self.dwipe.tempfile, "mkstemp", return_value=(123, "/mnt/secure.tmp")
         ), mock.patch.object(
             self.dwipe.sys.stdout, "write"
         ), mock.patch.object(
             self.dwipe.sys.stdout, "flush"
-        ), mock.patch(
-            "builtins.open", return_value=FakeFile()
         ), mock.patch(
             "builtins.print"
         ):
@@ -226,6 +233,112 @@ class CrossPlatformTests(unittest.TestCase):
         for pattern, expected in expected_chunks.items():
             with self.subTest(pattern=pattern):
                 self.assertEqual(self._capture_single_wipe_chunk(pattern), expected)
+
+    def test_wipe_free_space_uses_secure_tempfile_creation(self):
+        class FakeProgressBar:
+            disable = False
+
+            def update(self, amount):
+                return None
+
+            def close(self):
+                return None
+
+        class FakeFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def write(self, chunk):
+                raise OSError(errno.ENOSPC, "disk full")
+
+            def flush(self):
+                return None
+
+            def fileno(self):
+                return 1
+
+        time_values = iter([0, 1, 2])
+
+        with mock.patch.object(self.dwipe, "find_writable_path", return_value=("/mnt", 16)), mock.patch.object(
+            self.dwipe, "get_device_path_for_mount", return_value=None
+        ), mock.patch.object(
+            self.dwipe, "tqdm", return_value=FakeProgressBar()
+        ), mock.patch.object(
+            self.dwipe.time, "time", side_effect=lambda: next(time_values)
+        ), mock.patch.object(
+            self.dwipe.atexit, "register"
+        ), mock.patch.object(
+            self.dwipe.atexit, "unregister"
+        ), mock.patch.object(
+            self.dwipe.signal, "signal"
+        ), mock.patch.object(
+            self.dwipe.os.path, "exists", return_value=True
+        ), mock.patch.object(
+            self.dwipe.os, "remove"
+        ), mock.patch.object(
+            self.dwipe.os, "sync"
+        ), mock.patch.object(
+            self.dwipe.os, "fsync"
+        ), mock.patch.object(
+            self.dwipe.os, "chmod"
+        ) as chmod_mock, mock.patch.object(
+            self.dwipe.tempfile, "mkstemp", return_value=(123, "/mnt/secure.tmp")
+        ) as mkstemp_mock, mock.patch.object(
+            self.dwipe.os, "fdopen", return_value=FakeFile()
+        ) as fdopen_mock, mock.patch.object(
+            self.dwipe.sys.stdout, "write"
+        ), mock.patch.object(
+            self.dwipe.sys.stdout, "flush"
+        ), mock.patch(
+            "builtins.print"
+        ):
+            self.dwipe.wipe_free_space(
+                root="/mnt",
+                passes=1,
+                block_size=16,
+                verify=False,
+                pattern="zeroes",
+                no_confirm=True,
+            )
+
+        mkstemp_mock.assert_called_once_with(dir="/mnt", prefix=".dwipe_free_space_", suffix=".tmp")
+        chmod_mock.assert_called_once_with("/mnt/secure.tmp", 0o600)
+        fdopen_mock.assert_called_once_with(123, "wb")
+
+    def test_verify_written_samples_accepts_matching_data(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"abcdefghij")
+            path = handle.name
+
+        try:
+            verified, message = self.dwipe.verify_written_samples(
+                path,
+                [(0, b"abcd"), (6, b"ghij")],
+            )
+        finally:
+            os.remove(path)
+
+        self.assertTrue(verified)
+        self.assertIn("Verified 2 sample region", message)
+
+    def test_verify_written_samples_detects_mismatch(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"abcdefghij")
+            path = handle.name
+
+        try:
+            verified, message = self.dwipe.verify_written_samples(
+                path,
+                [(0, b"zzzz")],
+            )
+        finally:
+            os.remove(path)
+
+        self.assertFalse(verified)
+        self.assertIn("offset 0", message)
 
     def test_wipe_free_space_switches_to_format_with_selected_options(self):
         with mock.patch.object(self.dwipe, "find_writable_path", return_value=("/mnt", 1024)), mock.patch.object(
