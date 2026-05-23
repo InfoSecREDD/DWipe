@@ -3,6 +3,8 @@ import os
 import sys
 import subprocess
 import platform
+import json
+import shutil
 
 # Global variable to store disk information
 SELECTED_DISK_INFO = None
@@ -66,7 +68,8 @@ def ensure_venv():
         # Execute the script within the virtual environment
         os.execv(python_bin, [python_bin] + sys.argv)
 
-ensure_venv()
+if os.environ.get('DWIPE_SKIP_VENV_BOOTSTRAP') != '1':
+    ensure_venv()
 
 # --- IMPORTS AFTER VENV ---
 import errno
@@ -191,6 +194,225 @@ def get_friendly_fs_type(fs_type):
     else:
         return fs_type.upper() if fs_type else "Unknown"
 
+
+def command_exists(command):
+    """Return True when a command is available on PATH."""
+    return shutil.which(command) is not None
+
+
+def get_windows_shell():
+    """Return the preferred PowerShell executable on Windows."""
+    for shell in ('powershell.exe', 'powershell', 'pwsh.exe', 'pwsh'):
+        if command_exists(shell):
+            return shell
+    return None
+
+
+def run_windows_powershell(script):
+    """Run a PowerShell command and return the completed process."""
+    shell = get_windows_shell()
+    if not shell:
+        raise FileNotFoundError("PowerShell is not available on PATH")
+    return subprocess.run(
+        [shell, '-NoProfile', '-Command', script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+
+def parse_windows_disk_number(value):
+    """Extract the disk number from Windows disk identifiers."""
+    if value is None:
+        return None
+
+    raw_value = str(value).strip()
+    match = re.search(r'physicaldrive(\d+)', raw_value, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    match = re.fullmatch(r'(?:disk\s+)?(\d+)', raw_value, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def normalize_windows_disk_path(value):
+    """Convert Windows disk identifiers to \\.\\PhysicalDriveN form."""
+    disk_number = parse_windows_disk_number(value)
+    if disk_number is None:
+        return None
+    return f"\\\\.\\PhysicalDrive{disk_number}"
+
+
+def extract_windows_drive_letter(path):
+    """Extract a Windows drive letter from a path."""
+    match = re.match(r'^([A-Za-z]):', str(path).strip())
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def disk_path_exists(system, disk_path):
+    """Check whether a disk path is valid for the current platform."""
+    if system == 'Windows':
+        return parse_windows_disk_number(disk_path) is not None
+    return os.path.exists(disk_path)
+
+
+def get_linux_base_device(device_name):
+    """Resolve a Linux partition device to its parent disk."""
+    if not device_name:
+        return device_name
+
+    if command_exists('lsblk'):
+        try:
+            parent = subprocess.check_output(
+                ['lsblk', '-no', 'PKNAME', device_name],
+                stderr=subprocess.STDOUT
+            ).decode('utf-8').strip()
+            if parent:
+                return f"/dev/{parent}"
+        except Exception:
+            pass
+
+    if re.match(r'^/dev/(nvme\d+n\d+|mmcblk\d+)p\d+$', device_name):
+        return re.sub(r'p\d+$', '', device_name)
+
+    return re.sub(r'\d+$', '', device_name)
+
+
+def get_parent_disk_path(device_path, system=None):
+    """Convert a mounted filesystem device into its parent disk path."""
+    system = system or platform.system()
+
+    if not device_path:
+        return None
+
+    if system == 'Darwin':
+        match = re.match(r'(/dev/disk\d+)', device_path)
+        return match.group(1) if match else device_path
+
+    if system == 'Linux':
+        return get_linux_base_device(device_path)
+
+    if system == 'Windows':
+        return normalize_windows_disk_path(device_path)
+
+    return device_path
+
+
+def get_device_path_for_mount(root, system=None):
+    """Resolve the whole-disk device that backs a mounted path."""
+    system = system or platform.system()
+
+    if system in ('Darwin', 'Linux'):
+        try:
+            disk_info = subprocess.check_output(['df', '-P', root], stderr=subprocess.STDOUT).decode('utf-8')
+            lines = disk_info.strip().split('\n')
+            if len(lines) > 1:
+                return get_parent_disk_path(lines[1].split()[0], system=system)
+        except Exception:
+            return None
+
+    if system == 'Windows':
+        drive_letter = extract_windows_drive_letter(root)
+        if not drive_letter:
+            return None
+
+        result = run_windows_powershell(
+            f'$partition = Get-Partition -DriveLetter "{drive_letter}" -ErrorAction Stop | Select-Object -First 1; '
+            'if ($null -ne $partition) { $partition.DiskNumber }'
+        )
+        if result.returncode == 0:
+            return normalize_windows_disk_path(result.stdout.strip())
+
+    return None
+
+
+def get_windows_physical_drives():
+    """Enumerate mounted Windows volumes with their backing disks."""
+    result = run_windows_powershell(
+        '$results = @(); '
+        'Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { '
+        '  $volume = $_; '
+        '  $partition = Get-Partition -DriveLetter $volume.DriveLetter -ErrorAction SilentlyContinue | Select-Object -First 1; '
+        '  if ($partition) { '
+        '    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue; '
+        '    if ($disk) { '
+        '      $results += [PSCustomObject]@{ '
+        '        DiskNumber = $disk.Number; '
+        '        Device = "\\\\.\\PhysicalDrive$($disk.Number)"; '
+        '        FriendlyName = $disk.FriendlyName; '
+        '        MountPoint = "$($volume.DriveLetter):\"; '
+        '        FileSystem = $volume.FileSystem; '
+        '        Size = [Int64]$volume.Size; '
+        '        Free = [Int64]$volume.SizeRemaining '
+        '      } '
+        '    } '
+        '  } '
+        '}; '
+        'if ($results.Count -gt 0) { $results | ConvertTo-Json -Compress }'
+    )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    payload = json.loads(result.stdout)
+    if isinstance(payload, dict):
+        payload = [payload]
+
+    physical_drives = []
+    seen_devices = set()
+    for entry in payload:
+        device = entry.get('Device')
+        mountpoint = entry.get('MountPoint')
+        if not device or not mountpoint or device in seen_devices:
+            continue
+        seen_devices.add(device)
+        size = int(entry.get('Size') or 0)
+        free = int(entry.get('Free') or 0)
+        physical_drives.append({
+            'id': len(physical_drives),
+            'device': device,
+            'name': entry.get('FriendlyName') or f"Disk {entry.get('DiskNumber')}",
+            'mountpoint': mountpoint,
+            'fstype': get_friendly_fs_type(entry.get('FileSystem')),
+            'size': size,
+            'size_human': format_size(size),
+            'free': free
+        })
+
+    return physical_drives
+
+
+def unmount_linux_targets(disk_path):
+    """Unmount a Linux disk and any mounted child partitions."""
+    targets = []
+
+    if command_exists('lsblk'):
+        try:
+            output = subprocess.check_output(
+                ['lsblk', '-lnpo', 'NAME,MOUNTPOINT', disk_path],
+                stderr=subprocess.STDOUT
+            ).decode('utf-8')
+            for line in output.splitlines():
+                parts = line.split(None, 1)
+                if parts:
+                    targets.append(parts[0])
+        except Exception:
+            pass
+
+    if disk_path not in targets:
+        targets.append(disk_path)
+
+    for target in reversed(targets):
+        try:
+            subprocess.run(['umount', target], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception:
+            pass
+
 def get_macos_disk_info():
     """Get detailed disk information for macOS systems."""
     try:
@@ -202,7 +424,7 @@ def get_macos_disk_info():
         for line in disks_output.split('\n'):
             if line.startswith('/dev/disk'):
                 disk_id = line.split()[0].replace('/dev/', '')
-                if disk_id not in physical_disks and not any(c.isdigit() and c != disk_id[-1] for c in disk_id):
+                if disk_id not in physical_disks and re.fullmatch(r'disk\d+', disk_id):
                     physical_disks.append(disk_id)
         
         disk_info = {}
@@ -320,24 +542,29 @@ def get_physical_drives():
                 'size_human': info.get('size_human', 'Unknown'),
                 'free': info.get('free', 0)
             })
+    elif system == 'Windows':
+        try:
+            physical_drives = get_windows_physical_drives()
+        except Exception:
+            physical_drives = []
+    elif system == 'Windows':
+        try:
+            physical_drives = get_windows_physical_drives()
+        except Exception:
+            physical_drives = []
     else:
         # For non-macOS systems, use a more generic approach with psutil
         seen_devices = set()
         
         for part in psutil.disk_partitions(all=True):
             try:
-                # Skip non-physical drives on Windows
-                if system == 'Windows' and ('cdrom' in part.opts or part.fstype == ''):
+                if system == 'Linux' and not part.device.startswith('/dev/'):
                     continue
                 
                 # Get the base device name (e.g., "sda" from "sda1")
                 device_name = part.device
                 if system == 'Linux':
-                    # For Linux: /dev/sda1 → sda
-                    base_device = re.sub(r'[0-9]+$', '', device_name)
-                elif system == 'Windows':
-                    # For Windows, just use the drive letter
-                    base_device = device_name[:2] if len(device_name) >= 2 else device_name
+                    base_device = get_linux_base_device(device_name)
                 else:
                     # For other systems, keep as is
                     base_device = device_name
@@ -522,7 +749,7 @@ def is_path_writable(path):
     except (OSError, PermissionError):
         return False
 
-def find_writable_path(suggested_path):
+def find_writable_path(suggested_path, allow_cross_volume_fallback=True):
     """Find a writable path, starting with the suggested one."""
     # Special handling for volumes that might be read-only
     suggested_path = find_writable_path_for_volume(suggested_path)
@@ -536,6 +763,12 @@ def find_writable_path(suggested_path):
         except:
             pass
     
+    if not allow_cross_volume_fallback:
+        return None, 0
+
+    if not allow_cross_volume_fallback:
+        return None, 0
+
     # Try common writable locations
     system = platform.system()
     
@@ -718,51 +951,15 @@ def wipe_free_space(root='/', passes=3, block_size=1048576, verify=False, patter
         root, free_space = interactive_drive_selection()
     else:
         # Ensure the target path is writable
-        original_root = root
-        root, free_space = find_writable_path(root)
+        root, free_space = find_writable_path(root, allow_cross_volume_fallback=False)
     
     if root is None:
         print(f"{RED}{BRIGHT}Error: Could not find a writable location. Please run with sudo or specify a writable path.{RESET}")
         sys.exit(1)
     
     # Ask if the user wants to format the entire device instead
-    device_path = None
-    if platform.system() == 'Darwin':  # macOS
-        # Try to extract disk identifier from the mount point
-        try:
-            disk_info = subprocess.check_output(['df', '-h', root], stderr=subprocess.STDOUT).decode('utf-8')
-            lines = disk_info.strip().split('\n')
-            if len(lines) > 1:
-                device_path = lines[1].split()[0]  # Get the device path from df output
-        except:
-            pass
-    elif platform.system() == 'Linux':
-        # Try to get the device from mount point
-        try:
-            disk_info = subprocess.check_output(['df', '-h', root], stderr=subprocess.STDOUT).decode('utf-8')
-            lines = disk_info.strip().split('\n')
-            if len(lines) > 1:
-                device_path = lines[1].split()[0]  # Get the device path from df output
-        except:
-            pass
-    elif platform.system() == 'Windows':
-        # Try to get the device from mount point
-        try:
-            # Get volume information for the selected path
-            ps_cmd = f'Get-WmiObject -Query "SELECT * FROM Win32_Volume WHERE DriveLetter = \'{root[:2]}\'"'
-            vol_info = subprocess.check_output(['powershell', '-Command', ps_cmd], stderr=subprocess.STDOUT).decode('utf-8')
-            
-            # Extract the device ID (e.g., \\.\PHYSICALDRIVE1)
-            device_match = re.search(r'DeviceID\s*:\s*(.+)', vol_info)
-            if device_match:
-                device_id = device_match.group(1).strip()
-                # Extract the number from the device ID
-                disk_num_match = re.search(r'PHYSICALDRIVE(\d+)', device_id)
-                if disk_num_match:
-                    device_path = f"\\\\.\\PhysicalDrive{disk_num_match.group(1)}"
-        except:
-            pass
-    
+    device_path = get_device_path_for_mount(root)
+
     # If we found a device path, ask if they want to format it
     if device_path:
         format_prompt = f"Would you like to format the entire device ({device_path})\ninstead of just wiping free space?"
@@ -1247,9 +1444,17 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     
     # Determine current operating system
     system = platform.system()
+    original_disk_path = disk_path
+    disk_number = None
+    temporary_mountpoint = None
+
+    if system == 'Windows':
+        disk_number = parse_windows_disk_number(disk_path)
+        if disk_number is not None:
+            disk_path = normalize_windows_disk_path(disk_path)
     
     # Validate the disk path exists
-    if not os.path.exists(disk_path):
+    if not disk_path_exists(system, disk_path):
         print(f"{RED}{BRIGHT}Error: Disk {disk_path} not found.{RESET}")
         sys.exit(1)
 
@@ -1359,26 +1564,21 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                         
             elif system == 'Windows':
                 try:
-                    # Get disk info using PowerShell
-                    ps_cmd = f'Get-Disk | Where-Object {{ $_.DeviceId -eq "{disk_id}" }} | Format-List'
-                    disk_info_cmd = subprocess.check_output(['powershell', '-Command', ps_cmd], 
-                                                          stderr=subprocess.STDOUT).decode('utf-8')
-                    
-                    # Extract size and model info from the output
-                    size_match = re.search(r'Size\s*:\s*([0-9,]+)', disk_info_cmd)
-                    model_match = re.search(r'FriendlyName\s*:\s*(.+)', disk_info_cmd)
-                    
-                    if size_match:
-                        size_bytes = int(size_match.group(1).replace(',', ''))
+                    result = run_windows_powershell(
+                        f'Get-Disk -Number {disk_number} | Select-Object Number, FriendlyName, Size | ConvertTo-Json -Compress'
+                    )
+                    if result.returncode != 0:
+                        raise subprocess.CalledProcessError(result.returncode, 'powershell', result.stderr)
+                    payload = json.loads(result.stdout)
+
+                    if payload.get('Size'):
+                        size_bytes = int(payload['Size'])
                         disk_info['size'] = size_bytes
                         disk_info['size_human'] = format_size(size_bytes)
-                    
-                    if model_match:
-                        disk_info['name'] = model_match.group(1).strip()
-                    else:
-                        disk_info['name'] = f"Disk {disk_id}"
-                        
-                except (subprocess.CalledProcessError, FileNotFoundError):
+
+                    disk_info['name'] = payload.get('FriendlyName') or f"Disk {disk_number}"
+
+                except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
                     print(f"{YELLOW}Warning: Unable to get detailed disk information{RESET}")
         except Exception as e:
             print(f"{YELLOW}Warning: Error getting disk info: {e}{RESET}")
@@ -1387,7 +1587,7 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     if not disk_info:
         print(f"{YELLOW}Warning: Unable to get detailed information about {disk_path}.{RESET}")
         disk_info = {
-            'name': os.path.basename(disk_path),
+            'name': os.path.basename(original_disk_path),
             'size_human': "Unknown size"
         }
     
@@ -1467,10 +1667,13 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                     'fat32': 'FAT32',
                     'exfat': 'ExFAT',
                     'ntfs': 'NTFS',
-                    'ext4': 'ExFAT'  # ext4 not natively supported, fallback to ExFAT
+                    'vfat': 'FAT32'
                 }
                 
-                fs_format = fs_map.get(filesystem.lower(), filesystem.upper())
+                if filesystem.lower() not in fs_map:
+                    print(f"{RED}Error: Unsupported filesystem {filesystem} for macOS.{RESET}")
+                    sys.exit(1)
+                fs_format = fs_map[filesystem.lower()]
                 
                 # Add label if specified, otherwise use a default
                 disk_label = label if label else "FORMATTED"
@@ -1501,11 +1704,7 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                 
             elif system == 'Linux':
                 # Linux formatting approach
-                # First, we may need to unmount the disk if it's mounted
-                try:
-                    subprocess.run(['umount', disk_path], stderr=subprocess.PIPE)
-                except Exception:
-                    pass  # Ignore errors from unmount
+                unmount_linux_targets(disk_path)
                     
                 # Format based on filesystem type
                 if filesystem.lower() == 'ext4':
@@ -1577,17 +1776,18 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                 fs_map = {
                     'fat32': 'FAT32',
                     'exfat': 'exFAT',
-                    'ntfs': 'NTFS',
-                    'ext4': 'NTFS',  # ext4 not supported on Windows, fallback to NTFS
-                    'hfs+': 'NTFS'   # HFS+ not supported on Windows, fallback to NTFS
+                    'ntfs': 'NTFS'
                 }
                 
-                fs_format = fs_map.get(filesystem.lower(), 'NTFS')
+                if filesystem.lower() not in fs_map:
+                    print(f"{RED}Error: Unsupported filesystem {filesystem} for Windows.{RESET}")
+                    sys.exit(1)
+                fs_format = fs_map[filesystem.lower()]
                 
                 try:
                     # Write the diskpart script
                     with open(script_file, 'w') as f:
-                        f.write(f"select disk {disk_id}\n")
+                        f.write(f"select disk {disk_number}\n")
                         f.write("clean\n")
                         f.write("create partition primary\n")
                         f.write("select partition 1\n")
@@ -1637,6 +1837,8 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
     # Function to get the mount point of the newly formatted disk
     def get_disk_mountpoint():
         """Get the mount point of the formatted disk."""
+        nonlocal temporary_mountpoint
+
         if system == 'Darwin':  # macOS
             try:
                 # For macOS, use diskutil info to get the mount point
@@ -1647,6 +1849,16 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
                 mount_match = re.search(r'Mount Point:\s+(.+)', info)
                 if mount_match:
                     return mount_match.group(1).strip()
+
+                list_info = subprocess.check_output(['diskutil', 'list', disk_id],
+                                                    stderr=subprocess.STDOUT).decode('utf-8')
+                partition_match = re.search(r'(/dev/disk\d+s\d+)', list_info)
+                if partition_match:
+                    info = subprocess.check_output(['diskutil', 'info', partition_match.group(1)],
+                                                stderr=subprocess.STDOUT).decode('utf-8')
+                    mount_match = re.search(r'Mount Point:\s+(.+)', info)
+                    if mount_match:
+                        return mount_match.group(1).strip()
                     
                 # Check for volume path if mount point not found
                 vol_match = re.search(r'Volume Name:\s+(.+)', info)
@@ -1662,32 +1874,62 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
         elif system == 'Linux':
             try:
                 # For Linux, use lsblk to get the mount point
-                mount_info = subprocess.check_output(['lsblk', '-no', 'MOUNTPOINT', disk_path], 
+                mount_info = subprocess.check_output(['lsblk', '-nrpo', 'MOUNTPOINT', disk_path], 
                                                     stderr=subprocess.STDOUT).decode('utf-8').strip()
                 if mount_info:
-                    return mount_info
+                    for line in mount_info.splitlines():
+                        line = line.strip()
+                        if line:
+                            return line
             except:
                 pass
+
+            temporary_mountpoint = tempfile.mkdtemp(prefix='dwipe-mount-')
+            result = subprocess.run(['mount', disk_path, temporary_mountpoint],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True)
+            if result.returncode == 0:
+                return temporary_mountpoint
+
+            try:
+                os.rmdir(temporary_mountpoint)
+            except OSError:
+                pass
+            temporary_mountpoint = None
                 
         elif system == 'Windows':
             try:
-                # For Windows, use wmic to get the drive letter
-                drive_letter = None
-                if re.match(r'\\\\.\\PhysicalDrive\d+', disk_path):
-                    # Extract the disk number
-                    disk_num = re.search(r'PhysicalDrive(\d+)', disk_path).group(1)
-                    # Get partition info for the disk
-                    ps_cmd = f'Get-Partition -DiskNumber {disk_num} | Select-Object -ExpandProperty DriveLetter'
-                    drive_letter = subprocess.check_output(['powershell', '-Command', ps_cmd], 
-                                                         stderr=subprocess.STDOUT).decode('utf-8').strip()
-                    if drive_letter:
-                        return f"{drive_letter}:\\"
+                result = run_windows_powershell(
+                    f'Get-Partition -DiskNumber {disk_number} | '
+                    'Where-Object { $_.DriveLetter } | '
+                    'Select-Object -First 1 -ExpandProperty DriveLetter'
+                )
+                drive_letter = result.stdout.strip()
+                if result.returncode == 0 and drive_letter:
+                    return f"{drive_letter}:\\"
             except:
                 pass
                 
         # If we couldn't determine the mount point, return None
         return None
-    
+
+    def cleanup_temporary_mountpoint():
+        """Unmount and remove any temporary Linux mount point created for wiping."""
+        nonlocal temporary_mountpoint
+
+        if system != 'Linux' or not temporary_mountpoint:
+            return
+
+        try:
+            subprocess.run(['umount', temporary_mountpoint], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        finally:
+            try:
+                os.rmdir(temporary_mountpoint)
+            except OSError:
+                pass
+            temporary_mountpoint = None
+
     try:
         # Step 1: Initial format to prepare the disk
         print(f"{CYAN}{BRIGHT}╔═══════════════════════════════════════════════════════════╗{RESET}")
@@ -1951,6 +2193,8 @@ def format_disk(disk_path, filesystem='exfat', label=None, no_confirm=False, pas
         else:
             print(f"{YELLOW}Warning: Could not determine mount point for disk {disk_path}.{RESET}")
             print(f"{YELLOW}Skipping free space wiping. The disk may not be fully secure.{RESET}")
+
+        cleanup_temporary_mountpoint()
         
         # Step 3: Final format to complete the secure erase
         print(f"\n{CYAN}{BRIGHT}╔═══════════════════════════════════════════════════════════╗{RESET}")
