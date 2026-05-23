@@ -147,6 +147,27 @@ class CrossPlatformTests(unittest.TestCase):
         self.assertTrue(self.dwipe.disk_path_exists("Windows", "4"))
         self.assertFalse(self.dwipe.disk_path_exists("Windows", "diskX"))
 
+    def test_normalize_windows_disk_path_returns_canonical_form(self):
+        self.assertEqual(
+            self.dwipe.normalize_windows_disk_path("PhysicalDrive5"),
+            r"\\.\PhysicalDrive5",
+        )
+        self.assertEqual(
+            self.dwipe.normalize_windows_disk_path("8"),
+            r"\\.\PhysicalDrive8",
+        )
+        self.assertIsNone(self.dwipe.normalize_windows_disk_path("diskX"))
+
+    def test_get_parent_disk_path_normalizes_darwin_and_windows(self):
+        self.assertEqual(
+            self.dwipe.get_parent_disk_path("/dev/disk3s1", system="Darwin"),
+            "/dev/disk3",
+        )
+        self.assertEqual(
+            self.dwipe.get_parent_disk_path("7", system="Windows"),
+            r"\\.\PhysicalDrive7",
+        )
+
     def test_get_device_path_for_mount_uses_parent_linux_disk(self):
         with mock.patch.object(
             self.dwipe.subprocess,
@@ -339,6 +360,33 @@ class CrossPlatformTests(unittest.TestCase):
 
         self.assertFalse(verified)
         self.assertIn("offset 0", message)
+
+    def test_update_verification_samples_keeps_first_two_and_latest(self):
+        samples = []
+
+        self.dwipe.update_verification_samples(samples, 0, b"aaaa")
+        self.dwipe.update_verification_samples(samples, 4, b"bbbb")
+        self.dwipe.update_verification_samples(samples, 8, b"cccc")
+        self.dwipe.update_verification_samples(samples, 12, b"dddd")
+
+        self.assertEqual(samples, [(0, b"aaaa"), (4, b"bbbb"), (12, b"dddd")])
+
+    def test_get_confirmation_accepts_yes_and_defaults_to_no(self):
+        with mock.patch("builtins.input", return_value="yes"), mock.patch("builtins.print"):
+            self.assertTrue(self.dwipe.get_confirmation("Proceed?", box_style=True))
+
+        with mock.patch("builtins.input", return_value=""), mock.patch("builtins.print"):
+            self.assertFalse(self.dwipe.get_confirmation("Proceed?", box_style=False))
+
+    def test_format_time_human_readable_supports_full_and_abbreviated_output(self):
+        self.assertEqual(
+            self.dwipe.format_time_human_readable(3661, abbreviated=False),
+            "1 hour 1 minute",
+        )
+        self.assertEqual(
+            self.dwipe.format_time_human_readable(3661, abbreviated=True),
+            "1h 1m",
+        )
 
     def test_wipe_free_space_switches_to_format_with_selected_options(self):
         with mock.patch.object(self.dwipe, "find_writable_path", return_value=("/mnt", 1024)), mock.patch.object(
